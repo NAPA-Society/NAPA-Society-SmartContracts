@@ -1,9 +1,10 @@
+
 /**
- *Submitted for verification at Etherscan.io on 2022-06-30
+ *Submitted for verification at Etherscan.io on 2022-07-21
 */
 
 pragma solidity ^0.8.0;
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL
 
 library SafeMath {
   /**
@@ -717,6 +718,30 @@ contract NAPA is ERC20, Ownable {
     // store addresses that are automatic market maker pairs
     mapping (address => bool) public automatedMarketMakerPairs;
 
+    // buy & sell fee
+    uint256 internal buyFee;
+    uint256 internal sellFee;
+    
+    // buy & sell limits
+    uint256 public buyLimit;
+    uint256 public sellLimit;
+
+    // time lock
+    bool public timeLimit = false;
+
+
+    uint public buyTimeLock = 86400;
+    uint public sellTimeLock = 86400;
+
+    // pause trading
+    bool public paused = false;
+
+    mapping (address => uint256) _sellTime;
+    mapping (address => uint256) _buyTime;
+
+    // black listed address
+    mapping(address => bool) public _isBlacklisted;
+
     // events
 
     event UpdateTreasuryWallet(address indexed newAddress, address indexed oldAddress);
@@ -727,9 +752,14 @@ contract NAPA is ERC20, Ownable {
 
     event SetAutomatedMarketMakerPair(address indexed pair, bool indexed value);
 
+    event Blacklisted(address account);
+
     // constructor
 
     constructor() ERC20("NAPA Society", "NAPA") {
+        buyFee = 1;
+        sellFee = 2;
+
         treasuryWallet = address(0x2BC68c7D1a1DfFFE08F02e3eF3c7ED8d322B9CfB);
         address owner_ = address(0xC3330271fC4465f2481476AD96FcF635F07Aa2Dc);
 
@@ -738,7 +768,10 @@ contract NAPA is ERC20, Ownable {
         excludeFromFees(owner_, true);
         excludeFromFees(treasuryWallet, true);
 
-        // minting process
+        buyLimit = 500000000000000000000;
+        sellLimit = 500000000000000000000000;
+
+        // minting only once when deployed.
         uint256 initialSupply = 1000000000 * (10 ** 18);
 
         _mint(owner_, initialSupply.mul(90).div(100));
@@ -758,7 +791,7 @@ contract NAPA is ERC20, Ownable {
         treasuryWallet = newAddress;
     }
 
-     function excludeFromFees(address account, bool excluded) public onlyOwner {
+    function excludeFromFees(address account, bool excluded) public onlyOwner {
         require(isExcludedFromFees[account] != excluded, "NAPA: Account is already the value of 'excluded'");
         isExcludedFromFees[account] = excluded;
 
@@ -792,31 +825,109 @@ contract NAPA is ERC20, Ownable {
         return from != uniswapRouter && automatedMarketMakerPairs[to];
     }
 
-    function _transfer(
-        address from,
-        address to,
-        uint256 amount
-    ) internal override {
-        if (
-            _isBuy(from) &&
-            !isExcludedFromFees[to]
-        ) {
-            uint256 buyingFee = amount.mul(1).div(100);
+    function _transfer(address from, address to, uint256 amount) internal override {
+        require(!paused, "Trading is paused");
+        require(from != to, "Sending to yourself is disallowed");
+        require(!_isBlacklisted[from] && !_isBlacklisted[to],    "Blacklisted account");
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+ 
+        // indicates if fee should be deducted from transfer
+        bool takeFee = true;
+
+        // if any account belongs to _isExcludedFromFee account then remove the fee
+        if(isExcludedFromFees[from] || isExcludedFromFees[to]){
+            takeFee = false;
+        }
+
+        _validateTransfer(from, to, amount, takeFee);
+
+        if(timeLimit){
+            _validateTime(from , to , takeFee);
+        }
+
+        if (_isBuy(from) && !isExcludedFromFees[to]) {
+            uint256 buyingFee = amount.mul(buyFee).div(100);
+
             amount -= buyingFee;
 
             super._transfer(from, treasuryWallet, buyingFee);
         }
 
-        if (
-            _isSell(from, to) &&
-            !isExcludedFromFees[from]
-        ) {
-            uint256 sellingFee = amount.mul(2).div(100);
+        if (_isSell(from, to) && !isExcludedFromFees[from]) {
+            uint256 sellingFee = amount.mul(sellFee).div(100);
+
             amount -= sellingFee;
 
             super._transfer(from, treasuryWallet, sellingFee);
         }
 
         super._transfer(from, to, amount);
+    }
+
+    function _validateTransfer(address sender,address recipient,uint256 amount,bool takeFee ) private view {
+        // Excluded addresses don't have limits
+        if (takeFee) {
+            if (_isBuy(sender) && buyLimit != 0) {
+                require(amount <= buyLimit, "Buy amount exceeds limit");
+            } else if (_isSell(sender, recipient) && sellLimit != 0) {
+                require(amount <= sellLimit, "Sell amount exceeds limit");
+            }
+        }
+    }
+
+    function _validateTime(address sender, address recipient, bool takeFee) private {   
+         // Excluded addresses don't have time limits
+        if (takeFee) {
+            if (_isBuy(sender)) {
+                require(_buyTime[recipient] + buyTimeLock <= block.timestamp, "wait 4 minutes to buy again");
+                _buyTime[recipient] = block.timestamp;
+            } else if (_isSell(sender, recipient)) {
+                require(_sellTime[sender] + sellTimeLock <= block.timestamp, "wait 5 minutes to sell again");
+                _sellTime[sender] = block.timestamp;
+            }
+        }
+    }
+
+    function updateBuyLimit(uint256 limit) external onlyOwner {
+        buyLimit = limit;
+    }
+
+    function updateSellLimit(uint256 limit) external onlyOwner {
+        sellLimit = limit;
+    }
+
+    function addToBlacklist(address account) external onlyOwner {
+        _isBlacklisted[account] = true;
+        emit Blacklisted(account);
+    }
+
+    function removeFromBlacklist(address account) external onlyOwner {
+        _isBlacklisted[account] = false;
+    }
+
+    function _isExcludedFromFee(address account) public view returns(bool) {
+        return isExcludedFromFees[account];
+    }
+
+    function updateBuyFee(uint256 _fee) external onlyOwner {
+        buyFee = _fee;
+    }
+
+    function updateSellFee(uint256 _fee) external onlyOwner {
+        sellFee = _fee;
+    }
+
+    function updateBuyTimeLimit(uint256 _time) external onlyOwner {
+        buyTimeLock = _time;
+    }
+
+    function updateSellTimeLimit(uint256 _time) external onlyOwner {
+        sellTimeLock = _time;
+    }
+
+    function updatePauseState() external onlyOwner {
+        paused = !paused;
     }
 }
